@@ -1,0 +1,12 @@
+{
+  "name": "ticketmaster-backend",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "echo \"no dev server yet — coming next file\" && exit 1"
+  }
+}
