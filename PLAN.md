@@ -1,488 +1,247 @@
-# Ticketmaster Clone — Back-End Implementation Plan
+# Virtual Waiting Room — Back-End Build Guide
 
-**Stack:** Node.js 20 + TypeScript, PostgreSQL, Redis, Elasticsearch, Kafka (Redpanda for local), Docker Compose.
-**Layout strategy:** Monolith-first. Single Node app exposing all routes, internally organized into "service modules" with the boundaries each microservice would have. Extract to separate processes only when the patterns demand it (Phase 4 WebSocket, Phase 7 outbox worker).
+**Stack:** Express + TypeScript, Redis, native `ws` library for WebSocket. **No** Postgres, **no** Kafka, **no** Elasticsearch.
 
-The goal is to learn distributed-systems patterns by building them, not to ship a polished product. Each phase delivers working software you can demo.
-
----
-
-## 0. Guiding Principles
-
-- **Patterns over polish.** Every phase must visibly demonstrate the pattern it introduces (lock contention, CDC lag, pub/sub fan-out, etc.). Write a short note in `PATTERNS.md` as you implement each one.
-- **No ORM magic.** Use a thin query builder (Kysely or raw `pg`). You should be able to read every SQL query you emit.
-- **Idempotency from day one.** Every mutating endpoint accepts `Idempotency-Key`. Cheap to add early, painful to retrofit.
-- **Correlation IDs everywhere.** `X-Request-ID` propagates through HTTP → Kafka → logs.
-- **Test the concurrency story.** A failing concurrent-reservation test is the most important regression alarm in this codebase.
+This is a study guide, not a code spec. Each step explains *what you're building* and *why it matters*. You write the code yourself; come back if you want a refresher on the "why."
 
 ---
 
-## 1. Repository Layout (Monolith with Service Boundaries)
+## What you'll have at the end
+
+A back-end with **three running processes** and **one Redis container**:
+
+1. **`api`** (Express) — answers HTTP requests and accepts WebSocket connections.
+2. **`worker`** (plain Node script) — pops users from the queue at a fixed rate and signs admission tokens.
+3. **`redis`** (Docker) — stores the queue itself and carries pub/sub messages between worker and api.
+
+End-to-end story: a user joins the queue → they see their position tick down live over WebSocket → when their turn comes, they receive a signed JWT → they hand the JWT to a protected endpoint, which lets them in.
+
+---
+
+## The big picture (read this first, refer back often)
 
 ```
-TicketMaster-Back-End/
-├── docker-compose.yml          # postgres, redis, kafka, elasticsearch, debezium
-├── docker-compose.override.yml # local-only ports, hot reload mounts
-├── package.json                # single root package; workspaces optional later
-├── tsconfig.json
-├── .env.example
-├── README.md
-├── ARCHITECTURE.md
-├── API.md                      # OpenAPI 3 spec
-├── PATTERNS.md                 # explanation of each pattern as you implement
-├── PLAN.md                     # this file
-│
-├── src/
-│   ├── app.ts                  # Fastify app bootstrap
-│   ├── server.ts               # HTTP listener
-│   ├── config.ts               # env parsing (zod)
-│   │
-│   ├── modules/
-│   │   ├── events/             # Event Service module
-│   │   │   ├── routes.ts
-│   │   │   ├── service.ts
-│   │   │   ├── repository.ts
-│   │   │   └── cache.ts
-│   │   ├── search/             # Search Service module
-│   │   │   ├── routes.ts
-│   │   │   └── es-client.ts
-│   │   ├── inventory/          # Inventory Service module
-│   │   │   ├── routes.ts
-│   │   │   ├── service.ts
-│   │   │   ├── redis-state.ts  # HASH-per-section state
-│   │   │   └── publisher.ts    # Pub/Sub emit
-│   │   ├── bookings/           # Booking Service module (CRITICAL)
-│   │   │   ├── routes.ts
-│   │   │   ├── service.ts
-│   │   │   ├── lock.ts         # SET NX, Lua release
-│   │   │   ├── repository.ts
-│   │   │   ├── confirm.ts
-│   │   │   └── expiry-worker.ts
-│   │   ├── payments/           # Payment Service module
-│   │   │   ├── routes.ts       # webhook handler
-│   │   │   ├── provider-mock.ts
-│   │   │   └── hmac.ts
-│   │   ├── websocket/          # WS server (split to own process in Phase 4)
-│   │   │   ├── server.ts
-│   │   │   ├── subscriptions.ts
-│   │   │   └── pubsub.ts
-│   │   └── users/              # JWT mock + GET /users/me/bookings
-│   │       ├── routes.ts
-│   │       └── auth.ts
-│   │
-│   ├── shared/
-│   │   ├── db/
-│   │   │   ├── pool.ts         # pg Pool
-│   │   │   ├── migrate.ts      # node-pg-migrate runner
-│   │   │   └── migrations/     # SQL migrations
-│   │   ├── redis/
-│   │   │   └── client.ts       # ioredis instances (cmd + pubsub)
-│   │   ├── kafka/
-│   │   │   ├── producer.ts
-│   │   │   └── consumer.ts
-│   │   ├── logging/
-│   │   │   └── logger.ts       # Pino + correlation id
-│   │   ├── errors/
-│   │   │   └── domain-errors.ts
-│   │   ├── idempotency/
-│   │   │   └── store.ts        # Redis-backed
-│   │   └── metrics/
-│   │       └── prom.ts         # prom-client
-│   │
-│   └── workers/
-│       ├── sync-worker.ts      # Kafka → Elasticsearch
-│       ├── expiry-worker.ts    # cleanup expired pending bookings
-│       └── outbox-worker.ts    # Phase 7
-│
-├── seed/
-│   ├── venues.ts               # 1 venue, 5 sections, 100 seats
-│   ├── events.ts               # 5 events on that venue
-│   └── run.ts
-│
-├── scripts/
-│   ├── load/                   # k6 scripts
-│   │   ├── search.js
-│   │   ├── reserve-hot-seat.js
-│   │   └── hot-event-launch.js
-│   └── chaos/                  # kill -9 redis, etc. (Phase 7)
-│
-└── test/
-    ├── unit/                   # mocked deps
-    ├── integration/            # testcontainers (real redis+pg)
-    │   ├── reservation-concurrency.test.ts   # THE test
-    │   ├── booking-lifecycle.test.ts
-    │   ├── webhook-idempotency.test.ts
-    │   └── cdc-sync.test.ts
-    └── e2e/                    # full docker-compose up
+   ┌──────────┐  POST /queue/:eventId/join         ┌──────────────┐
+   │          │ ─────────────────────────────────► │              │
+   │  Browser │                                    │   Express    │
+   │          │  WS /ws/queue/:eventId/:userId     │     (api)    │
+   │          │ ◄════════════════════════════════► │              │
+   │          │                                    │              │
+   │          │  GET /admitted/hello + JWT         │              │
+   │          │ ─────────────────────────────────► │              │
+   └──────────┘                                    └──────┬───────┘
+                                                          │  ZADD / ZRANK
+                                                          │  (commands)
+                                                          ▼
+                                                   ┌──────────────┐
+                                                   │    Redis     │
+                                                   │   sorted set │
+                                                   │   + pub/sub  │
+                                                   └──────┬───────┘
+                                                          ▲
+                                                          │  ZPOPMIN @ N/sec
+                                                          │  PUBLISH token
+                                                   ┌──────┴───────┐
+                                                   │   Worker     │
+                                                   │  (Node loop) │
+                                                   └──────────────┘
 ```
 
----
-
-## 2. Tech Choices (Locked)
-
-| Concern | Choice | Why |
-|---|---|---|
-| HTTP framework | **Fastify** | Fast, schema-first, good Pino integration |
-| Validation | **zod** | Same schemas usable for env, request body, Kafka payloads |
-| DB driver | **pg** + **Kysely** | Type-safe queries you can still read as SQL |
-| Migrations | **node-pg-migrate** | SQL-first, no model classes |
-| Redis | **ioredis** | Lua eval, pub/sub, robust reconnection |
-| Kafka client | **kafkajs** | Pure JS, works against Redpanda |
-| ES client | **@elastic/elasticsearch** | Official |
-| Logging | **Pino** | JSON, fast, request-scoped child loggers |
-| Metrics | **prom-client** | `/metrics` endpoint |
-| Testing | **Vitest** + **testcontainers** | Fast unit + real-infra integration |
-| Load testing | **k6** | Scripted scenarios, threshold assertions |
-| Local Kafka | **Redpanda** | Single binary, Kafka API compatible, no ZK |
+Keep this picture in your head. Every step below is a piece of it.
 
 ---
 
-## 3. Database Schema (Phase 1)
+## Phase A — Foundation
 
-`src/shared/db/migrations/0001_initial.sql`:
+You're setting up an empty TypeScript project that can run Express. No queue logic yet.
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+### Step 1 — `package.json` + `tsconfig.json`
+**What:** Declare a TypeScript Node project. Add `express`, `@types/express`, `typescript`, `tsx`, `pino`, `zod`.
+**Why:** `tsx` lets you run `.ts` files directly without a build step — critical for fast iteration. `pino` is the structured logger we'll use everywhere. `zod` is for validating env vars and (later) request bodies.
+**Watch out for:** Use `"type": "module"` so modern `import` syntax works. With Express on ESM you'll need `import express from 'express'`, not `const express = require(...)`.
 
-CREATE TABLE users (
-  user_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email   TEXT UNIQUE NOT NULL,
-  name    TEXT NOT NULL,
-  payment_info_ref TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+### Step 2 — `.gitignore` + `.env.example`
+**What:** Ignore `node_modules`, `dist`, `.env`. The `.env.example` documents the keys you'll need: `PORT`, `REDIS_URL`, `JWT_SECRET`, `ADMIT_PER_SECOND`.
+**Why:** Anyone (including future-you) can clone the repo and see exactly which env vars are required.
 
-CREATE TABLE venues (
-  venue_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name     TEXT NOT NULL,
-  address  TEXT NOT NULL,
-  city     TEXT NOT NULL,
-  seat_map JSONB NOT NULL
-);
+### Step 3 — `docker-compose.yml` (Redis only)
+**What:** One service: `redis:7`. Map port 6379. No volumes (queue can be ephemeral for now).
+**Why:** Redis is the only piece of infra you need. Postgres and Kafka stay deliberately absent — they're not part of this slice.
+**Watch out for:** Once up, sanity check with `docker exec -it <name> redis-cli PING` → `PONG`. If that fails, nothing else will work.
 
-CREATE TABLE events (
-  event_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name      TEXT NOT NULL,
-  venue_id  UUID NOT NULL REFERENCES venues(venue_id),
-  date_time TIMESTAMPTZ NOT NULL,
-  performer TEXT,
-  status    TEXT NOT NULL CHECK (status IN ('upcoming','on_sale','sold_out','cancelled')),
-  category  TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX events_by_city_date ON events (venue_id, date_time);
-CREATE INDEX events_by_status   ON events (status);
+### Step 4 — `src/config.ts`
+**What:** Read `process.env`, validate it with zod, export a typed `config` object.
+**Why:** Crashes at startup instead of in the middle of a request when an env var is missing. Zero `process.env` references anywhere else — everything reads `config`.
 
-CREATE TABLE seats (
-  seat_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  venue_id UUID NOT NULL REFERENCES venues(venue_id),
-  section  TEXT NOT NULL,
-  row      TEXT NOT NULL,
-  number   INT  NOT NULL,
-  UNIQUE (venue_id, section, row, number)
-);
+### Step 5 — `src/shared/logger.ts`
+**What:** Create a Pino logger. Export it.
+**Why:** Structured JSON logs from day one. Every later module imports this one logger.
 
-CREATE TABLE tickets (
-  ticket_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  event_id  UUID NOT NULL REFERENCES events(event_id),
-  seat_id   UUID NOT NULL REFERENCES seats(seat_id),
-  price_cents INT NOT NULL,
-  status    TEXT NOT NULL CHECK (status IN ('available','reserved','sold')) DEFAULT 'available',
-  version   INT NOT NULL DEFAULT 0,  -- for optimistic concurrency (stretch)
-  UNIQUE (event_id, seat_id)
-);
-CREATE INDEX tickets_by_event_status ON tickets (event_id, status);
+### Step 6 — `src/shared/redis.ts`
+**What:** Create **two** ioredis clients: `redis` (for commands like ZADD) and `redisSub` (for subscribing to channels). Export both.
+**Why:** **This is the key Redis pattern to internalize.** A Redis connection that is subscribed to a channel cannot issue regular commands — that's a Redis protocol-level rule. So you need a second connection for commands. Every Node app that does pub/sub follows this two-client pattern.
 
-CREATE TABLE bookings (
-  booking_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id    UUID NOT NULL REFERENCES users(user_id),
-  event_id   UUID NOT NULL REFERENCES events(event_id),
-  ticket_ids UUID[] NOT NULL,
-  status     TEXT NOT NULL CHECK (status IN ('pending','processing','confirmed','expired','cancelled','failed')),
-  total_cents INT NOT NULL,
-  expires_at  TIMESTAMPTZ,
-  payment_intent_id TEXT,
-  idempotency_key TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  confirmed_at TIMESTAMPTZ,
-  UNIQUE (user_id, idempotency_key)
-);
-CREATE INDEX bookings_expiring ON bookings (expires_at) WHERE status = 'pending';
+### Step 7 — `src/server.ts`
+**What:** Boot Express. One route: `GET /health` returns `{ ok: true }`. Listen on `config.PORT`.
+**Why:** Proves the wiring (config + logger + Express) works before any business logic is added.
 
-CREATE TABLE outbox (
-  id          BIGSERIAL PRIMARY KEY,
-  aggregate   TEXT NOT NULL,
-  event_type  TEXT NOT NULL,
-  payload     JSONB NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  published_at TIMESTAMPTZ
-);
-CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
-
-CREATE TABLE webhook_events (
-  event_id   TEXT PRIMARY KEY,           -- idempotency
-  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  payload    JSONB NOT NULL
-);
-```
-
-**Modeling notes**
-- `ticket_ids UUID[]` keeps the schema simple for the learning project; in production this would be a `booking_tickets` join table.
-- `tickets.version` is unused initially but in place for the optimistic-concurrency stretch goal (alternative to Redis locks).
-- `outbox` and `webhook_events` are introduced now even though they're Phase 6/7 — cheap to migrate later but cleaner to ship the schema once.
+**Phase A demo:** `pnpm dev` + `curl localhost:3000/health` → `{ ok: true }`. Redis is up but unused. **Stop here, make sure it's all working before moving on.**
 
 ---
 
-## 4. Phase-by-Phase Plan
+## Phase B — The Queue (Redis sorted set patterns)
 
-Each phase ends with: (1) a demo command, (2) a test that proves the pattern works, (3) one paragraph in `PATTERNS.md`.
+Now you implement the queue itself. The whole pattern hinges on understanding **why Redis sorted sets are the right tool**.
 
-### Phase 1 — Foundation (week 1)
+### Step 8 — `src/queue/keys.ts`
+**What:** A helper that returns `waitroom:event:${eventId}`.
+**Why:** Centralizing key naming prevents typo bugs and makes it trivial to add a prefix later (e.g., `prod:` vs `dev:`).
 
-**Deliverable:** `curl localhost:3000/api/v1/events/{id}` returns event detail with seats from Postgres.
+### Step 9 — `src/queue/service.ts` — `join(eventId, userId)`
+**What:** Run `ZADD <key> NX <timestamp-ms> <userId>`, then `ZRANK <key> <userId>` to get position.
+**Why this matters (deeply):**
+- `ZADD` with `NX` is **atomic and idempotent**: if the user is already in the queue, score doesn't change, they keep their position. No double-enqueue bugs.
+- `ZRANK` returns the user's position in O(log N), which means the queue can have a million users and answering "what position am I?" is still microseconds.
+- Score = timestamp gives you natural FIFO ordering. No counter, no race condition.
+**Watch out for:** `ZRANK` is **0-indexed**. Position 0 is the front of the line. Decide whether your API returns 0-indexed ("you're at position 0") or 1-indexed ("you're #1"). Pick one and document it.
 
-Tasks:
-1. `package.json`, `tsconfig.json`, `.env.example`, ESLint + Prettier.
-2. `docker-compose.yml` with `postgres:16` and `redis:7` only.
-3. `src/config.ts` — zod-parsed env, fails fast.
-4. `src/shared/db/pool.ts`, migration runner, run `0001_initial.sql`.
-5. `seed/run.ts` — insert 1 venue (5 sections × 4 rows × 5 seats = 100 seats), 5 events, generate one ticket per (event × seat) — 500 tickets total.
-6. Fastify app skeleton with `/health`, request-id middleware, Pino logger.
-7. `modules/events/routes.ts` → `GET /api/v1/events/:id` (raw Postgres read, no cache yet).
-8. `modules/inventory/routes.ts` → `GET /api/v1/events/:id/sections/:section/seats` (raw Postgres read).
+### Step 10 — `src/queue/service.ts` — `getPosition(eventId, userId)`
+**What:** Single `ZRANK` call. If `null`, the user isn't in the queue (already admitted or never joined).
+**Why:** This is the fallback the front-end calls when its WebSocket drops. Without it, a disconnect = lost user.
 
-**Test:** integration test boots a testcontainer Postgres, runs migrations + seed, asserts both endpoints respond with the expected shape.
+### Step 11 — `src/queue/routes.ts`
+**What:** `POST /api/v1/queue/:eventId/join` and `GET /api/v1/queue/:eventId/position`. Validate body/query with zod. Call the service. Return JSON.
+**Why:** Thin route layer — all logic stays in `service.ts`. Easy to test the service independently.
 
----
-
-### Phase 2 — Booking Flow (week 2) — THE CRITICAL PHASE
-
-**Deliverable:** 100 concurrent reservations for 1 seat → exactly 1 success, 99 `409 SEATS_UNAVAILABLE`.
-
-Tasks:
-1. `shared/redis/client.ts` — split command client vs pub/sub client.
-2. `modules/bookings/lock.ts`:
-   - `acquire(ticketId, bookingId, userId)` → `SET reservation:{ticketId} {json} NX EX 600`.
-   - `release(ticketId, bookingId)` → Lua script (only DEL if `bookingId` matches).
-3. `modules/bookings/service.ts` — `createBooking()` following the pseudo-code in the context:
-   - Acquire locks one at a time; on any failure, release all previously acquired locks.
-   - Persist `bookings` row with `status='pending'`, `expires_at = now() + 10min`.
-   - Return `{ booking_id, expires_in_seconds: 600 }`.
-4. `POST /api/v1/bookings` route, zod-validated body.
-5. `DELETE /api/v1/bookings/:id` — release locks + set `status='cancelled'`. Only the owner can cancel.
-6. `POST /api/v1/bookings/:id/confirm`:
-   - Mock payment (sync, always succeeds for now).
-   - Inside a DB transaction: set booking `confirmed`, update tickets to `sold`, release Redis locks.
-7. `Idempotency-Key` header support (Redis-backed store with 24h TTL). Replay returns the cached response.
-8. `workers/expiry-worker.ts`: every 30s, sweep `bookings WHERE status='pending' AND expires_at < now()`, set to `expired`, mark tickets back to `available`. The Redis TTL handles the lock side; this worker handles DB cleanup.
-9. **The concurrency test.** `test/integration/reservation-concurrency.test.ts`:
-   ```ts
-   const attempts = await Promise.allSettled(
-     Array.from({ length: 100 }, () => createBooking(userId, eventId, [ticketId]))
-   );
-   const success = attempts.filter(a => a.status === 'fulfilled').length;
-   expect(success).toBe(1);
-   ```
-10. k6 script `scripts/load/reserve-hot-seat.js` — 1000 VUs hammering one seat for 30s; assert no double bookings via post-run DB query.
-
-**`PATTERNS.md` entries:** Distributed Lock with TTL, Idempotency Keys.
+**Phase B demo:** Curl `POST /queue/event-1/join` three times with different userIds. Use `redis-cli ZRANGE waitroom:event:event-1 0 -1 WITHSCORES` to see all three in order. Curl `GET /queue/event-1/position?userId=u1` → position 0.
 
 ---
 
-### Phase 3 — Search (week 3)
+## Phase C — The Admission Worker (rate limiting + capability tokens)
 
-**Deliverable:** Create a new event in Postgres, see it appear in `GET /api/v1/events?q=...` within ~2 seconds without any application code dual-writing.
+This is the heart of the slice. Take your time on these steps.
 
-Tasks:
-1. Add `elasticsearch:8`, `redpanda`, `debezium/connect` to `docker-compose.yml`.
-2. Configure Debezium Postgres connector via JSON POST at startup (`scripts/register-debezium.sh`):
-   - Captures `public.events` → topic `cdc.events`.
-3. `workers/sync-worker.ts`:
-   - Consume `cdc.events`.
-   - Transform CDC envelope → ES doc.
-   - Idempotent upsert into `events` ES index keyed by `event_id`.
-   - Commit Kafka offset only after ES ack.
-4. `modules/search/routes.ts` → `GET /api/v1/events` with filters: `q`, `city`, `category`, `date` (range), pagination.
-5. `seed/run.ts` extension: after DB seed, wait for CDC to populate ES (or `--bootstrap-es` flag for first run).
-6. **Integration test:** insert event row, poll ES until visible, assert search returns it. Log the delay; that's your CDC lag number.
+### Step 12 — `src/admission/jwt.ts`
+**What:** Two functions using the `jose` library: `sign({ userId, eventId })` returns a JWT string with a 5-minute expiry; `verify(token)` returns `{ userId, eventId }` or throws.
+**Why this matters:** This is the **capability token** pattern. The same shape powers:
+- Password reset links ("this link lets you reset *this* account for the next 30 min").
+- Magic login links.
+- S3 presigned URLs.
+- GitHub deploy tokens.
+- Stripe webhook signatures (similar idea, different mechanism).
+Understanding it once = understanding all of them.
+**Watch out for:**
+- Use **HS256** (symmetric) for this learning slice. RS256 (asymmetric) is for cross-service trust boundaries.
+- The `exp` claim is in **seconds**, not milliseconds. Mixing them up is a classic bug.
+- Always include `eventId` in the payload — it scopes the token. A token for event-1 should not work on event-2.
 
-**`PATTERNS.md` entry:** CDC with Debezium (vs dual-write — why we picked the harder option).
+### Step 13 — `src/worker/admit.ts`
+**What:** A separate Node entry point. On startup: `setInterval(tick, 1000 / config.ADMIT_PER_SECOND)`. On each tick: `ZPOPMIN <queue-key>` to get the next user, sign a JWT, `PUBLISH admission '{userId, eventId, token}'`.
+**Why this matters (deeply):**
+- `ZPOPMIN` is **atomic**: even if two worker instances ran (we won't, but in principle), the same user can't be popped twice.
+- The worker is a **leaky bucket**: queue can fill up at any rate (millions of joins/sec), but the worker drains at exactly N/sec, protecting whatever's downstream.
+- The worker and api are **separate processes** that share state *only* through Redis. This is microservices in miniature: no in-process function calls, just messages and shared state.
+**Watch out for:**
+- If the worker crashes between `ZPOPMIN` and `PUBLISH`, that user is gone from the queue but never got their token. For MVP, document this as a known limitation. For production, you'd use a "pending admissions" set as a safety net.
+- Make sure the worker process exits cleanly on `SIGINT` (Ctrl-C) so you don't accumulate zombie processes during development.
 
----
+### Step 14 — `package.json` script: `worker`
+**What:** Add `"worker": "tsx src/worker/admit.ts"`.
+**Why:** You'll run `pnpm dev` (api) and `pnpm worker` (admission worker) in two terminals. They're independent processes — that's the point.
 
-### Phase 4 — Real-Time Updates (week 4)
-
-**Deliverable:** Open the demo HTML page in two browser tabs; reserve a seat in tab A; tab B's seat goes red within 100ms.
-
-Tasks:
-1. **Split WebSocket out of the main process.** New entry point `src/ws-server.ts`. Now we have two Node processes sharing the same monolith codebase. Document this in `ARCHITECTURE.md`.
-2. `modules/websocket/server.ts` using `ws`:
-   - Path: `/ws/events/:event_id/seats`.
-   - On connect: store `{ socket, eventId }` in an in-memory `Map`.
-3. `shared/redis/pubsub.ts`: subscribe to `seat-changes:{event_id}` channel.
-4. `modules/inventory/publisher.ts`: on any seat status change, publish:
-   ```json
-   { "type":"seat_status_changed", "ticket_id":"...", "new_status":"reserved" }
-   ```
-5. Wire the booking flow's lock-acquire and confirm steps to call `publisher.emit()` after the DB commit.
-6. Run **two WS server instances** behind nothing (clients connect directly with a port). Both subscribe to Redis Pub/Sub → demonstrates Pub/Sub fan-out across instances.
-7. **Integration test:** open two WS clients, reserve a seat through the HTTP API, assert both receive the event.
-
-**`PATTERNS.md` entries:** Pub/Sub for Real-Time Distribution, Single-Writer Per Connection.
+**Phase C demo:** With api + worker both running, fill the queue with 5 users. In a third terminal, `redis-cli SUBSCRIBE admission` — you'll see published tokens flow by, one every `1000 / ADMIT_PER_SECOND` ms. The queue (`ZCARD`) drops to zero. **This is the leaky bucket in action.**
 
 ---
 
-### Phase 5 — Caching & Optimization (week 5)
+## Phase D — Protected Endpoint (proving the token works)
 
-**Deliverable:** `GET /events/:id` shows >95% Redis hit rate under load; section seat reads are one Redis call.
+### Step 15 — `src/admission/middleware.ts`
+**What:** Express middleware that reads `Authorization: Bearer <token>`, calls `verify()`, attaches `req.userId` and `req.eventId`, calls `next()`. On any failure: respond 401.
+**Why:** Every protected endpoint stays clean — no JWT logic in the route handlers. This is the **classic gateway/middleware pattern**: cross-cutting concerns (auth, logging, rate limits) live in middleware, not in business logic.
+**Watch out for:**
+- Use **constant-time comparison** for the signature check (the `jose` library handles this for you — don't be tempted to hand-roll it).
+- Distinguish between "missing token" (no `Authorization` header) and "invalid token" — both return 401 but log differently.
 
-Tasks:
-1. `modules/events/cache.ts` — cache-aside:
-   - Key: `event:{event_id}`, TTL 300s.
-   - Invalidate on event update (call from any write path).
-2. `modules/inventory/redis-state.ts`:
-   - On startup/seed, populate `event:{event_id}:section:{section}` as HASH of `{ticket_id → JSON(status,price)}`.
-   - `GET seats` endpoint switches to `HGETALL` (one round trip per section).
-   - On every booking state change, update the HASH field and publish the seat-changes message.
-3. Add `prom-client` metrics:
-   - `cache_hits_total{key}`, `cache_misses_total{key}`.
-   - `redis_lock_attempts_total{outcome}`.
-   - Histogram `http_request_duration_seconds{route, status}`.
-4. Expose `/metrics`; optional `grafana` + `prometheus` services in `docker-compose.override.yml`.
+### Step 16 — `src/admission/routes.ts`
+**What:** `GET /api/v1/admitted/hello` with the middleware applied. Returns `{ ok: true, userId, eventId }`.
+**Why:** It's the simplest possible protected resource. Once this works, *anything* could go behind it — the booking flow, the seat map, anything. That's the power of the capability-token pattern: the protected resource doesn't care how the user got there, only that they hold a valid token.
 
-**`PATTERNS.md` entries:** Cache-Aside, Cache Invalidation Strategy.
-
----
-
-### Phase 6 — Payment & Webhooks (week 6)
-
-**Deliverable:** `POST /bookings/:id/confirm` returns `processing`; mock provider POSTs `/webhooks/payment` ~2s later; booking flips to `confirmed` (or `failed`). Replaying the same webhook is a no-op.
-
-Tasks:
-1. `modules/payments/provider-mock.ts`:
-   - Separate Node process exposing `POST /v1/payment-intents` (returns intent id).
-   - Schedules a `setTimeout(2000)` that POSTs back to `http://api:3000/api/v1/webhooks/payment` signed with HMAC-SHA256.
-   - Random 5% failure rate to exercise the `failed` path.
-2. `modules/bookings/confirm.ts` update:
-   - `pending` → call provider → `processing`. Do not yet flip tickets to `sold`.
-3. `modules/payments/routes.ts`:
-   - Capture raw body before JSON parsing (Fastify content type parser).
-   - `hmac.ts`: timing-safe compare of `X-Signature` vs `hmac(rawBody, secret)`.
-   - Idempotency via `INSERT INTO webhook_events (event_id) ON CONFLICT DO NOTHING`; if conflict, return 200 without processing.
-   - On `payment.succeeded`: flip booking + tickets in one transaction, release Redis locks, publish seat-changes.
-   - On `payment.failed`: booking → `failed`, release locks, tickets → `available`, publish.
-4. **Integration test** `webhook-idempotency.test.ts`: post the same webhook 10× → exactly one DB mutation.
-
-**`PATTERNS.md` entries:** Webhook Signature Verification, State Machine for Bookings.
+**Phase D demo:**
+- Take a token from Phase C's `SUBSCRIBE` output.
+- `curl -H "Authorization: Bearer <token>" /admitted/hello` → 200 with user info.
+- Without the header → 401.
+- With a deliberately tampered token (change one character) → 401.
+- Wait 5 minutes, try again → 401 (expired).
 
 ---
 
-### Phase 7 — Advanced (week 7+)
+## Phase E — WebSocket Live Updates (cross-process pub/sub)
 
-Pick any subset. Each is self-contained.
+The final piece. The waiting room user shouldn't be polling — they should *see* their position move.
 
-- **Outbox pattern.** Replace direct `kafka.publish` in the booking flow with `INSERT INTO outbox` in the same transaction. `workers/outbox-worker.ts` polls and publishes, sets `published_at`. Demonstrates atomic DB write + event publish.
-- **Virtual Waiting Room.** Redis Sorted Set keyed by arrival time, worker dequeues N/sec, issues a short-lived JWT that the API gateway requires for `POST /bookings`. Load test: 10k users at t=0, watch them admitted at controlled rate.
-- **Rate limiting.** Token bucket per IP + per user at a Fastify hook. Per-event "burst" limits.
-- **Optimistic concurrency alternative.** Branch that drops Redis locks and uses `UPDATE tickets SET status='reserved' WHERE ticket_id=? AND version=? RETURNING *`. Run the same concurrency test against both implementations; compare throughput.
-- **Chaos.** `scripts/chaos/kill-redis.sh` mid-load test. Document recovery behavior.
+### Step 17 — `src/ws/connections.ts`
+**What:** A `Map<string, WebSocket>` keyed by `userId` (or `${eventId}:${userId}` to be safe). Export `add()`, `remove()`, `get()`.
+**Why:** This is the api process's in-memory mapping from user IDs to live WS sockets. When a pub/sub admission message arrives for `user-abc`, we look up which WS to push it to.
+**Watch out for:** **This map is per-process.** If you ran two api instances, they'd each have their own map and admissions could be routed to the wrong one. For a single api process this is fine. (In production, you'd either pin users to instances or have *every* instance subscribe and only push if the user is in their local map.)
 
----
+### Step 18 — `src/ws/pubsub.ts`
+**What:** Subscribe `redisSub` to the `admission` channel. On message, parse the JSON, look up the WS in the connections map, push `{ type: "admitted", token }` to that socket, then close the socket.
+**Why:** This is where **pub/sub fan-out** happens. The worker doesn't know which api process has the user's socket — it just publishes. Every api process gets the message and only the one with the matching socket acts.
 
-## 5. Local Dev — Docker Compose Plan
+### Step 19 — `src/ws/server.ts`
+**What:** Use the `ws` library's `WebSocketServer`. On upgrade for path `/ws/queue/:eventId/:userId`: parse the params, register the socket in connections, start a `setInterval` to push `{ type: "position", position, etaSeconds }` every 2 seconds via `getPosition`. On close: remove from connections, stop the interval.
+**Why:**
+- The 2-second polling on the server side (with Redis `ZRANK`) is *much* cheaper than the client polling over HTTP — same number of Redis calls, but no HTTP overhead and no flicker.
+- `etaSeconds = position / ADMIT_PER_SECOND` — a rough estimate, perfectly good for UX.
+**Watch out for:**
+- Always `clearInterval` on socket close. Otherwise you accumulate timers and slowly leak memory.
+- If `ZRANK` returns `null`, the user has been admitted but the WS is still open. Push `{ type: "admitted" }` proactively or wait for pub/sub to deliver it — whichever simplifies your code.
 
-`docker-compose.yml` final shape (added incrementally per phase):
-
-```yaml
-services:
-  postgres:        # Phase 1
-  redis:           # Phase 1
-  api:             # Phase 1 (Node main)
-  ws:              # Phase 4 (Node ws process)
-  redpanda:        # Phase 3 (Kafka API)
-  debezium:        # Phase 3
-  elasticsearch:   # Phase 3
-  sync-worker:     # Phase 3
-  expiry-worker:   # Phase 2
-  payment-mock:    # Phase 6
-  outbox-worker:   # Phase 7
-  prometheus:      # Phase 5 (override file)
-  grafana:         # Phase 5 (override file)
-```
-
-`make` targets (or npm scripts) for: `up`, `migrate`, `seed`, `logs`, `load:reserve`, `load:search`, `load:hot-event`, `test:int`, `test:concurrency`.
+**Phase E demo:** Use `websocat` (or a 10-line Node script) to open `ws://localhost:3000/ws/queue/event-1/user-abc`. After joining the queue, you'll see `position` messages every 2s. Run the worker; you'll see your position drop. When you reach the front, you receive `{ type: "admitted", token: "..." }` and the socket closes.
 
 ---
 
-## 6. Testing Strategy (Concrete)
+## Phase F — Wrap-up
 
-**Unit (Vitest, fast):**
-- `bookings/lock.ts` with a mocked ioredis — covers branch logic only.
-- `payments/hmac.ts` — signature happy path + tampered body.
-- `bookings/service.ts` rollback-on-partial-failure with mocked lock + DB.
+### Step 20 — `README.md`
+**What:** A "demo in 60 seconds" section showing: `docker compose up redis`, two terminals with api/worker, three curls, a `websocat` command.
+**Why:** When you come back to this in 3 months, you'll thank past-you.
 
-**Integration (Vitest + testcontainers):**
-- `reservation-concurrency.test.ts` (the headline test).
-- `booking-lifecycle.test.ts` — pending → confirmed and pending → expired.
-- `webhook-idempotency.test.ts` — 10x same webhook → 1 effect.
-- `cdc-sync.test.ts` — DB insert visible in ES within timeout.
-- `pubsub-fanout.test.ts` — two WS clients on two server instances both receive.
+### Step 21 — `seed.ts` (optional but recommended)
+**What:** A script that adds 100 fake users to the queue.
+**Why:** Without it, your front-end shows "you're #1" and you don't see anything interesting. With it, you're #87 and you can watch the number drop dramatically.
 
-**Load (k6):**
-- `search.js` — 1000 concurrent search VUs, p99 < 500ms threshold.
-- `reserve-hot-seat.js` — 1000 VUs racing for one seat, post-run SQL assertion: exactly 1 `sold`.
-- `hot-event-launch.js` — 10k VUs in 30s ramp, mixed search + reserve, measure error rate.
-
-Thresholds become CI gates in Phase 5+.
-
----
-
-## 7. Observability Plan
-
-- **Logs.** Pino JSON, every request gets a child logger with `request_id`. Booking flow logs structured events: `reservation_attempt`, `reservation_outcome`, `payment_callback`.
-- **Metrics.** Prometheus scrapes `/metrics` on api + ws + workers. Dashboards (Grafana, Phase 5):
-  - Booking funnel (attempts → reservations → confirmations).
-  - Redis SET NX failure rate.
-  - WebSocket connections per instance.
-  - CDC lag (max `published_at - created_at` in outbox once Phase 7 lands).
-- **Tracing (stretch).** OpenTelemetry SDK with OTLP exporter to Jaeger. Propagate `traceparent` through Kafka headers.
+### Step 22 — `PATTERNS.md`
+**What:** One paragraph per pattern you implemented, with file links:
+1. Redis sorted sets as a queue with position lookup.
+2. Two-client Redis pattern (commands + pub/sub).
+3. Pub/sub for cross-process fan-out.
+4. Capability tokens (signed JWT).
+5. Leaky bucket admission.
+6. WebSocket with REST fallback for recovery.
+**Why:** Writing them down is how you check whether you actually understood each one. If you can't write one paragraph, you don't understand it yet — go re-read the relevant step.
 
 ---
 
-## 8. Documentation Deliverables
+## Definition of done
 
-Tied to phases — write the doc when the feature lands, not at the end:
+1. ✅ `POST /queue/event-1/join` returns a position from Redis.
+2. ✅ The admission worker drains the queue at exactly `ADMIT_PER_SECOND`.
+3. ✅ A WebSocket client sees position decrease in real time.
+4. ✅ When admitted, the client receives a JWT, then the socket closes.
+5. ✅ `GET /admitted/hello` accepts the JWT and rejects forgeries/expired tokens.
+6. ✅ `PATTERNS.md` exists, with a paragraph for each pattern, written in your own words.
 
-| Doc | When | Contents |
-|---|---|---|
-| `README.md` | Phase 1 | Run locally, demo curls, architecture diagram screenshot |
-| `API.md` | Phase 2 | OpenAPI 3 spec, regenerated as routes evolve |
-| `PATTERNS.md` | Each phase | One section per pattern with code link + trade-off |
-| `ARCHITECTURE.md` | Phase 4 | Detailed design, why monolith-first, why CDC vs dual-write, sequence diagrams for booking + webhook |
-| `RUNBOOK.md` | Phase 7 | What to do when redis is down, when CDC lag spikes, etc. |
-
----
-
-## 9. Definition of Done
-
-The back-end is "done" when:
-
-1. `npm run test:concurrency` shows exactly 1 success out of 100 concurrent reservations for the same seat.
-2. `npm run demo:realtime` (or manual two-tab test) shows WebSocket updates across browser tabs.
-3. `npm run test:cdc` shows a new DB event reaches Elasticsearch via CDC within 5s.
-4. `npm run test:webhook-idempotency` passes with 10x replay.
-5. Booking state machine covers all six states with passing tests for each transition.
-6. `PATTERNS.md` has an entry for every pattern listed in the project context.
-7. `k6 run scripts/load/hot-event-launch.js` completes with p99 reservation < 1s and zero double-bookings.
+When all six tick, the back-end slice is done.
 
 ---
 
-## 10. First-Week Concrete Checklist
+## Explicitly out of scope
 
-Day 1: repo init, `package.json`, `tsconfig.json`, lint/format, `docker-compose.yml` (pg+redis), Fastify hello world.
-Day 2: migrations, seed script, `GET /events/:id`, `GET /events/:id/sections/:section/seats`.
-Day 3: ioredis wiring, `bookings/lock.ts` with SET NX + Lua release, unit tests.
-Day 4: `POST /bookings`, `DELETE /bookings/:id`, expiry worker.
-Day 5: `POST /bookings/:id/confirm` (sync mock payment), idempotency keys, integration test for the lifecycle.
-Day 6: the **concurrency integration test** — this is the milestone that proves Phase 2.
-Day 7: first k6 load test, write the Phase 2 `PATTERNS.md` entries.
+- Postgres, Kafka, Debezium, Elasticsearch — none of them.
+- Real authentication. `userId` is whatever the client sends. Anyone can claim to be anyone.
+- Booking flow, seat maps, payments — that's a *different* slice for a future day.
+- Load testing, metrics dashboards, multi-region deploy.
+- Multi-event optimizations. Hard-code `event-1` if it simplifies your code.
+
+These are not abandoned ideas — they're future work. Listing them here keeps us from drifting into them.
