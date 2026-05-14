@@ -7,6 +7,16 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "echo \"no dev server yet — coming next file\" && exit 1"
+    "dev": "tsx watch --env-file=.env src/server.ts"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsx": "^4.21.1",
+    "typescript": "^5.6.0"
   }
 }
