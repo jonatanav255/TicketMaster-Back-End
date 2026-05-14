@@ -73,6 +73,9 @@ You're setting up an empty TypeScript project that can run Express. No queue log
 **What:** Read `process.env`, validate it with zod, export a typed `config` object.
 **Why:** Crashes at startup instead of in the middle of a request when an env var is missing. Zero `process.env` references anywhere else — everything reads `config`.
 
+<!-- Learn more about Zod -->
+<!-- Learn more about Pino logger -->
+
 ### Step 5 — `src/shared/logger.ts`
 **What:** Create a Pino logger. Export it.
 **Why:** Structured JSON logs from day one. Every later module imports this one logger.
