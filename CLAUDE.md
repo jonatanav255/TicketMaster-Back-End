@@ -109,36 +109,7 @@ Per the project context document, the following are **explicitly out of scope**.
 
 ---
 
-## 8. Package Manager — pnpm only, never npm
-
-**Hard rule:** Use `pnpm` for everything Node-related in this repo. Never run `npm install`, `npm i`, `npm ci`, `npm update`, `npm exec`, `npm run`, `npx`, or any other `npm <subcommand>`.
-
-**Why:** Security. Recent npm supply-chain attacks (Shai-Hulud worm, compromised popular packages, malicious post-install scripts) make pnpm the safer default. pnpm's content-addressable store, strict peer resolution, and isolated `node_modules` reduce blast radius if a malicious package slips in. This is a deliberate defensive choice — do not "fall back" to npm even if a script, tutorial, or docs page suggests it.
-
-**Mapping for common commands:**
-
-| If you would run | Run instead |
-|---|---|
-| `npm install` | `pnpm install` |
-| `npm install <pkg>` | `pnpm add <pkg>` |
-| `npm install -D <pkg>` | `pnpm add -D <pkg>` |
-| `npm uninstall <pkg>` | `pnpm remove <pkg>` |
-| `npm ci` | `pnpm install --frozen-lockfile` |
-| `npm run <script>` | `pnpm <script>` |
-| `npx <bin>` (download) | `pnpm dlx <bin>` |
-| `npm update` | `pnpm update` |
-| `npm audit` | `pnpm audit` |
-| `npm publish` | `pnpm publish` |
-
-**`npx` exception:** `npx <bin>` is only acceptable when the binary is already a project dependency (resolved from local `node_modules`). For one-off tools that would download a package, use `pnpm dlx <bin>`.
-
-**Lockfile rule:** `pnpm-lock.yaml` is authoritative. If a `package-lock.json` ever appears in this repo, that's a mistake — surface it before deleting.
-
-If a task seems to *require* npm specifically (e.g., reproducing an npm-specific bug), surface it before running npm. Don't silently switch back.
-
----
-
-## 9. Working Memory Beyond This File
+## 8. Working Memory Beyond This File
 
 This file is the **canonical** source for working agreements. The AI's private memory (stored outside the repo) should not duplicate the rules here — it should only contain pointers back to this file. If a rule is added or changed, it goes here first, then a memory entry is updated if needed.
 
