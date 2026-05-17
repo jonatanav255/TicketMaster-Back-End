@@ -7,7 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch --env-file=.env src/server.ts"
+    "dev": "tsx watch --env-file=.env src/server.ts",
+    "worker": "tsx --env-file=.env src/worker/admit.ts"
   },
   "dependencies": {
     "express": "^5.2.1",
