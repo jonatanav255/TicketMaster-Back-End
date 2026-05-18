@@ -20,9 +20,9 @@ const timer = setInterval(() => {
   tick().catch((err) => logger.error({ err }, "tick failed"))
 }, intervalMs)
 
-const shutdown = () => {
+const shutdown = async () => {
   clearInterval(timer)
-  redis.quit()
+  await redis.quit()
   process.exit(0)
 }
 process.on("SIGINT", shutdown)
