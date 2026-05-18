@@ -9,8 +9,8 @@ const intervalMs = 1000 / env.ADMIT_PER_SECOND
 
 async function tick() {
   const popped = await redis.zpopmin(waitroomKey(eventId))
-  if (popped.length === 0) return
-  const userId = popped[0]
+  const [userId] = popped
+  if (!userId) return
   const token = await sign({ userId, eventId })
   await redis.publish("admission", JSON.stringify({ userId, eventId, token }))
   logger.info({ userId, eventId }, "admitted")
