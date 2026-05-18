@@ -13,8 +13,8 @@ export const requireAdmission: RequestHandler = async (req, res, next) => {
 
   try {
     const payload = await verify(token)
-    ;(req as any).userId = payload.userId
-    ;(req as any).eventId = payload.eventId
+    req.userId = payload.userId
+    req.eventId = payload.eventId
     next()
   } catch (err) {
     logger.warn({ err }, "admission token rejected")
